@@ -1,0 +1,28 @@
+export const channels=['MadsTwiiz','MadsTwiiz2nd','Bare Mads','Mads Gaming'];
+const date=d=>typeof d==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(d)&&!isNaN(Date.parse(d+'T12:00:00Z'))&&new Date(d+'T12:00:00Z').toISOString().slice(0,10)===d;
+const response=(body,status=200)=>Response.json(body,{status,headers:{'Cache-Control':'private, no-store','X-Content-Type-Options':'nosniff'}});
+export function workspaceIdentity(request,env){const id=request.headers.get('oai-authenticated-user-id'),email=request.headers.get('oai-authenticated-user-email')?.trim().toLowerCase();if(!id||!email)return null;const role=email===env.ADMIN_EMAIL?.toLowerCase()?'admin':email===env.MADS_EMAIL?.toLowerCase()?'mads':email===env.PATRICK_EMAIL?.toLowerCase()?'patrick':null;return role?{id,role,email}:null}
+export function cleanVideo(v){if(!v||typeof v.id!=='string'||!/^[a-zA-Z0-9_-]{1,100}$/.test(v.id)||typeof v.title!=='string'||!v.title.trim()||v.title.length>100||(v.intro!=null&&(typeof v.intro!=='string'||v.intro.length>20000))||(v.concept!=null&&(typeof v.concept!=='string'||v.concept.length>20000))||v.channel!=null&&!channels.includes(v.channel)||!Array.isArray(v.done)||v.done.length!==3||!v.done.every(x=>typeof x==='boolean')||!Array.isArray(v.dates)||v.dates.length!==3||!v.dates.every(date)||v.publishDate&&!date(v.publishDate)||v.plannedDates!=null&&(!Array.isArray(v.plannedDates)||v.plannedDates.length!==3||!v.plannedDates.every(d=>d===null||date(d)))||v.deletedAt!=null&&(typeof v.deletedAt!=='string'||!Number.isFinite(Date.parse(v.deletedAt))))return null;const video={id:v.id,title:v.title.trim(),intro:v.intro||'',concept:v.concept||'',channel:v.channel||null,dates:v.dates,done:v.done,publishDate:v.publishDate||'',plannedDates:v.plannedDates||[null,null,null]};if(v.deletedAt)video.deletedAt=v.deletedAt;return video}
+export async function workspace(request,env){
+ const user=workspaceIdentity(request,env);if(!user)return response({error:'Log ind med en konto, der har adgang til dette workspace.'},403);
+ if(!env.DB)return response({error:'Fælles lagring er endnu ikke tilgængelig.'},503);
+ if(request.method==='GET'){const rows=await env.DB.prepare('SELECT id, data, version FROM studio_videos ORDER BY rowid DESC').all(),meta=await env.DB.prepare("SELECT value FROM studio_meta WHERE id = 'initialized'").first();return response({user:{role:user.role,email:user.email},initialized:Boolean(meta),videos:rows.results.map(row=>({...JSON.parse(row.data),_version:row.version}))})}
+ if(request.method!=='POST')return response({error:'Metoden understøttes ikke.'},405);
+ if(request.headers.get('Origin')!==new URL(request.url).origin)return response({error:'Ugyldig oprindelse.'},403);
+ if(!request.headers.get('Content-Type')?.startsWith('application/json'))return response({error:'Forventede JSON.'},415);
+ let data;try{let size=0;const reader=request.body.getReader(),chunks=[];while(true){const {value,done}=await reader.read();if(done)break;size+=value.length;if(size>500000){await reader.cancel();return response({error:'For mange data.'},413)}chunks.push(value)}const bytes=new Uint8Array(size);let offset=0;for(const c of chunks){bytes.set(c,offset);offset+=c.length}data=JSON.parse(new TextDecoder().decode(bytes))}catch{return response({error:'Ugyldige data.'},400)}
+ if(data.action==='initialize'){
+  if(user.role!=='admin')return response({error:'Workspace-ejeren skal først overføre den eksisterende kalender.'},403);
+  if(!Array.isArray(data.videos)||data.videos.length>300)return response({error:'Ugyldig import.'},400);const videos=data.videos.map(cleanVideo);if(videos.some(v=>!v)||new Set(videos.map(v=>v.id)).size!==videos.length)return response({error:'Importen indeholder ugyldige videoer.'},400);
+  const statements=videos.map(v=>env.DB.prepare("INSERT INTO studio_videos (id,data,version) SELECT ?,?,1 WHERE NOT EXISTS (SELECT 1 FROM studio_meta WHERE id='initialized') ON CONFLICT(id) DO NOTHING").bind(v.id,JSON.stringify(v)));
+  statements.push(env.DB.prepare("INSERT INTO studio_meta(id,value) VALUES ('initialized','yes') ON CONFLICT(id) DO NOTHING"));await env.DB.batch(statements);return response({ok:true})
+ }
+ const initialized=await env.DB.prepare("SELECT value FROM studio_meta WHERE id='initialized'").first();if(!initialized)return response({error:'Ejeren skal først overføre kalenderen.'},409);
+ const v=cleanVideo(data.video);if(!v||!Number.isInteger(data.baseVersion)||data.baseVersion<0)return response({error:'Ugyldig video.'},400);
+ const row=await env.DB.prepare('SELECT data,version FROM studio_videos WHERE id=?').bind(v.id).first();
+ if(!row&&!v.channel)return response({error:'Vælg en kanal for den nye video.'},400);
+ if((row?.version||0)!==data.baseVersion)return response({error:'Videoen blev ændret på en anden enhed. Den nyeste version er hentet; prøv ændringen igen.'},409);
+ if(user.role==='patrick'&&(row?JSON.stringify(JSON.parse(row.data).done)!==JSON.stringify(v.done):v.done.some(Boolean)))return response({error:'Kun Mads kan ændre opgavernes status.'},403);
+ if(row){const result=await env.DB.prepare('UPDATE studio_videos SET data=?,version=version+1 WHERE id=? AND version=?').bind(JSON.stringify(v),v.id,data.baseVersion).run();if(!result.meta.changes)return response({error:'Samtidig ændring. Genindlæs videoen og prøv igen.'},409);return response({ok:true,version:data.baseVersion+1})}
+ const result=await env.DB.prepare('INSERT INTO studio_videos(id,data,version) VALUES (?,?,1) ON CONFLICT(id) DO NOTHING').bind(v.id,JSON.stringify(v)).run();if(!result.meta.changes)return response({error:'Videoen findes allerede. Hent den nyeste version.'},409);return response({ok:true,version:1})
+}

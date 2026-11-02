@@ -1,0 +1,4 @@
+// No calendar, credentials, or HTML are cached: shared data always stays online.
+self.addEventListener('install',event=>{self.skipWaiting()});
+self.addEventListener('activate',event=>{event.waitUntil(self.clients.claim())});
+self.addEventListener('fetch',event=>{if(event.request.method==='GET'&&event.request.mode==='navigate'){event.respondWith(fetch(event.request).catch(()=>new Response('<!doctype html><html lang="da"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Creator Studio</title><body style="background:#141216;color:#f9e9ef;font:18px system-ui;padding:12vw"><h1>Du er offline</h1><p>Opret forbindelse for at hente den fælles kalender.</p><button onclick="location.reload()">Prøv igen</button></body></html>',{headers:{'Content-Type':'text/html; charset=utf-8','Cache-Control':'no-store'}})))}});
